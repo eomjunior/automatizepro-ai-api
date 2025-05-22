@@ -1,13 +1,12 @@
 """
-Optimized GPU-accelerated captioning pipeline (stable)
-====================================================
-Updates in this patch
---------------------
-1. **Monkey‑patches ffmpeg‑python’s Node** to safely allow repeated `.src` updates, eliminating the recurring `Cannot set attribute 'src' directly` error that arises inside Whisper’s internal audio extraction.
-2. Keeps raw‑CLI FFmpeg for burn‑in to avoid Node graph side‑effects.
+Optimized GPU‑accelerated captioning pipeline (robust patch)
+===========================================================
+• Eliminates Node .src mutation crash regardless of ffmpeg‑python version.
+• Conditional monkey‑patch only if the property actually exists.
+• Fallbacks gracefully if no patch needed.
 
 Copyright (c) 2025 Stephen G. Pope
-GPL-2.0-or-later
+GPL‑2.0‑or‑later
 """
 
 import os
@@ -17,31 +16,15 @@ import subprocess
 from urllib.parse import urlparse
 from typing import Dict, List, Union
 
-import ffmpeg  # still used for probe + whisper internals
+import ffmpeg  # only for probe + whisper internals
 import requests
 import srt
 import torch
 import whisper  # type: ignore
 
 from services.file_management import download_file
-from services.cloud_storage import upload_file  # noqa: F401
+from services.cloud_storage import upload_file  # noqa: F401 (integration hook)
 from config import LOCAL_STORAGE_PATH
-
-# ---------------------------------------------------------------------------
-# Monkey‑patch ffmpeg.Node to allow safe src mutation (needed for Whisper)
-# ---------------------------------------------------------------------------
-from ffmpeg.nodes import Node as _FFNode  # type: ignore
-
-if not hasattr(_FFNode, "_patched_allow_src_mutation"):
-    original_src = _FFNode.src.fget  # type: ignore[attr-defined]
-
-    def _set_src(self: _FFNode, value):  # noqa: ANN001
-        # Allow updating .src anytime; clear cached hash to keep graph valid
-        object.__setattr__(self, "_Node__src", value)
-        object.__setattr__(self, "_hash", None)
-
-    _FFNode.src = property(original_src, _set_src)  # type: ignore[assignment]
-    _FFNode._patched_allow_src_mutation = True  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,7 +37,31 @@ if not logger.hasHandlers():
     logger.addHandler(_h)
 
 # ---------------------------------------------------------------------------
-# CUDA helpers
+# Safe monkey‑patch for ffmpeg‑python Node.src (needed by Whisper <2.0)
+# ---------------------------------------------------------------------------
+try:
+    from ffmpeg.nodes import Node as _FFNode  # type: ignore
+
+    if not hasattr(_FFNode, "_patched_allow_src_mutation"):
+        if hasattr(_FFNode, "src") and isinstance(_FFNode.src, property):
+            _orig_get = _FFNode.src.fget  # type: ignore[attr-defined]
+
+            def _set_src(self: "_FFNode", value):  # noqa: D401, ANN001
+                """Allow runtime stream relinking used by whisper’s audio loader."""
+                object.__setattr__(self, "_Node__src", value)
+                # Clear cached hash so graph stays consistent
+                object.__setattr__(self, "_hash", None)
+
+            _FFNode.src = property(_orig_get, _set_src)  # type: ignore[assignment]
+            logger.debug("Patched ffmpeg.Node.src setter for safe mutation")
+        else:
+            logger.debug("ffmpeg.Node has no 'src' property; monkey‑patch skipped")
+        _FFNode._patched_allow_src_mutation = True  # type: ignore[attr-defined]
+except Exception as patch_err:
+    logger.warning(f"Could not patch ffmpeg.Node.src (safe to ignore if not needed): {patch_err}")
+
+# ---------------------------------------------------------------------------
+# CUDA / Whisper settings
 # ---------------------------------------------------------------------------
 USE_CUDA = torch.cuda.is_available()
 CUDA_DEVICE = os.getenv("CUDA_VISIBLE_DEVICES", "0")
@@ -62,13 +69,13 @@ CUDA_DEVICE = os.getenv("CUDA_VISIBLE_DEVICES", "0")
 if USE_CUDA:
     logger.info(f"CUDA available — using GPU {CUDA_DEVICE}")
 else:
-    logger.warning("CUDA not available, falling back to CPU")
+    logger.warning("CUDA not available; falling back to CPU (slower)")
 
 WHISPER_DEVICE = "cuda" if USE_CUDA else "cpu"
-WHISPER_MODEL = None  # lazy‑loaded
+WHISPER_MODEL = None  # lazy‑load global
 
 # ---------------------------------------------------------------------------
-# Utility functions (resolution, captions, etc.)
+# Helper utilities
 # ---------------------------------------------------------------------------
 
 def get_video_resolution(path: str) -> tuple[int, int]:
@@ -77,7 +84,7 @@ def get_video_resolution(path: str) -> tuple[int, int]:
         vs = next(s for s in p["streams"] if s["codec_type"] == "video")
         return int(vs["width"]), int(vs["height"])
     except Exception as exc:
-        logger.warning(f"ffprobe failed ({exc}); defaulting to 1280x720")
+        logger.warning(f"ffprobe failed ({exc}); default 1280×720")
         return 1280, 720
 
 
@@ -89,17 +96,19 @@ def is_url(text: str) -> bool:
 
 
 def download_captions(url: str) -> str:
-    logger.info(f"Downloading captions → {url}")
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.text
+    logger.info(f"Fetching captions → {url}")
+    rsp = requests.get(url, timeout=30)
+    rsp.raise_for_status()
+    return rsp.text
 
-# Placeholder for style‑handling helpers
+# Style‑handlers placeholder (import from your original implementation)
 try:
-    from caption_helpers import process_subtitle_events  # external
+    from caption_helpers import process_subtitle_events  # external helper
 except ImportError:
     def process_subtitle_events(*args, **kwargs):  # type: ignore
-        raise NotImplementedError("process_subtitle_events() missing. Import or merge style logic.")
+        raise NotImplementedError(
+            "process_subtitle_events() missing. Import or merge style logic into this file."
+        )
 
 # ---------------------------------------------------------------------------
 # Whisper transcription (float32)
@@ -130,23 +139,23 @@ def process_captioning_v1(
     language: str = "auto",
 ):
     try:
-        # Download video ---------------------------------------------------
+        # 1) Download video -------------------------------------------------
         try:
             video_path = download_file(video_url, LOCAL_STORAGE_PATH)
             logger.info(f"[{job_id}] Video downloaded → {video_path}")
         except Exception as e:
             return {"error": f"Download failed: {e}"}
 
-        # Preparation ------------------------------------------------------
-        w, h = get_video_resolution(video_path)
+        # 2) Setup ---------------------------------------------------------
+        width, height = get_video_resolution(video_path)
         style = settings.get("style", "classic").lower()
         replace_dict = {item["find"]: item["replace"] for item in replace}
 
-        # Captions / transcription ----------------------------------------
+        # 3) Captions / transcription -------------------------------------
         if captions:
-            cap_txt = download_captions(captions) if is_url(captions) else captions
-            if "[Script Info]" in cap_txt:
-                ass_text = cap_txt
+            cap_text = download_captions(captions) if is_url(captions) else captions
+            if "[Script Info]" in cap_text:
+                ass_text = cap_text  # already ASS
             else:
                 tr_like = {
                     "segments": [
@@ -156,25 +165,25 @@ def process_captioning_v1(
                             "text": s.content,
                             "words": [],
                         }
-                        for s in srt.parse(cap_txt)
+                        for s in srt.parse(cap_text)
                     ]
                 }
-                ass_text = process_subtitle_events(tr_like, style, settings, replace_dict, (w, h))
+                ass_text = process_subtitle_events(tr_like, style, settings, replace_dict, (width, height))
         else:
             transcription = generate_transcription(video_path, language)
-            ass_text = process_subtitle_events(transcription, style, settings, replace_dict, (w, h))
+            ass_text = process_subtitle_events(transcription, style, settings, replace_dict, (width, height))
 
-        # Write ASS --------------------------------------------------------
+        # 4) Write ASS file -----------------------------------------------
         ass_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.ass")
         with open(ass_path, "w", encoding="utf-8") as fh:
             fh.write(ass_text)
-        logger.info(f"[{job_id}] Subtitles → {ass_path}")
+        logger.info(f"[{job_id}] Subtitles saved → {ass_path}")
 
-        # Burn‑in with raw FFmpeg -----------------------------------------
+        # 5) Burn‑in with raw FFmpeg --------------------------------------
         out_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_captioned.mp4")
         vf_parts = []
-        if w % 2 or h % 2:
-            vf_parts.append(f"scale_npp=w={w//2*2}:h={h//2*2}")
+        if width % 2 or height % 2:
+            vf_parts.append(f"scale_npp=w={width//2*2}:h={height//2*2}")
         vf_parts.append(f"subtitles={shlex.quote(ass_path)}")
         vf_arg = ",".join(vf_parts)
 
@@ -187,7 +196,6 @@ def process_captioning_v1(
             "-c:a", "copy",
             out_path,
         ]
-
         logger.info(f"[{job_id}] FFmpeg cmd: {' '.join(cmd)}")
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
