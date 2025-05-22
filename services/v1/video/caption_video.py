@@ -225,38 +225,27 @@ def process_captioning_v1(
 
         # 5. Burn-in with raw FFmpeg (NVENC) ------------------------------
         output_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_captioned.mp4")
+        # ---- inside process_captioning_v1() (build command section) ----
         vf_parts: List[str] = []
-        if width % 2 or height % 2:  # ensure even dims for NVENC
-            vf_parts.append(f"scale_npp=w={width//2*2}:h={height//2*2}")
+
+        # ensure even dimensions for 2-mod-h264
+        if width % 2 or height % 2:
+            # use CPU scale, not scale_npp
+            vf_parts.append(f"scale=w={width//2*2}:h={height//2*2}")
+
         vf_parts.append(f"subtitles={shlex.quote(ass_path)}")
         vf_arg = ",".join(vf_parts)
 
         cmd = [
             "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-hwaccel",
-            "cuda",
-            "-hwaccel_output_format",
-            "cuda",
-            "-i",
-            video_path,
-            "-vf",
-            vf_arg,
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-rc",
-            "vbr",
-            "-qmin",
-            "19",
-            "-qmax",
-            "23",
-            "-c:a",
-            "copy",
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",               # keep NVDEC
+            # -hwaccel_output_format cuda,    # <<< REMOVE THIS LINE
+            "-i", video_path,
+            "-vf", vf_arg,
+            "-c:v", "h264_nvenc",             # still NVENC on the way out
+            "-preset", "p4", "-rc", "vbr", "-qmin", "19", "-qmax", "23",
+            "-c:a", "copy",
             output_path,
         ]
         logger.info("[%s] FFmpeg cmd: %s", job_id, " ".join(cmd))
