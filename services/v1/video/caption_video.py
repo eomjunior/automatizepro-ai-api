@@ -1,17 +1,18 @@
 """
-Optimized GPU-accelerated captioning pipeline (final node-patch)
-================================================================
-• Keeps the robust patches that let Whisper/Triton mutate `.src`
-  without crashing.  
-• Uses CUDA + NVENC when available.  
-• Delegates subtitle styling/event generation to
-  `caption_helpers.process_subtitle_events`.
-
+Optimized GPU-accelerated captioning pipeline
+=============================================
+• Robust patches for ffmpeg-python and Triton so Whisper can mutate `.src`
+  without crashing.
+• Uses CUDA decode (NVDEC) and NVENC encode when available.
+• Delegates subtitle styling/event generation to `caption_helpers`.
+• Filter graph now runs on CPU (`scale` + `subtitles`) to avoid CUDA↔CPU
+  mismatch errors.
 GPL-2.0-or-later — 2025 Stephen G. Pope
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import shlex
@@ -19,13 +20,18 @@ import subprocess
 from typing import Dict, List, Tuple, Union
 from urllib.parse import urlparse
 
-import ffmpeg                   # probe + used by Whisper
+import ffmpeg  # probe + used by Whisper internally
 import requests
 import srt
 import torch
 import whisper  # type: ignore
 
-from .caption_helpers import process_subtitle_events  # <-- NEW import
+# Prefer relative import if helper lives alongside this file; fall back to absolute.
+try:
+    from .caption_helpers import process_subtitle_events
+except ImportError:  # pragma: no cover
+    from caption_helpers import process_subtitle_events  # type: ignore
+
 from config import LOCAL_STORAGE_PATH
 from services.cloud_storage import upload_file  # noqa: F401
 from services.file_management import download_file
@@ -41,7 +47,7 @@ if not logger.hasHandlers():
     logger.addHandler(_h)
 
 # ---------------------------------------------------------------------------
-# Robust patch 1: make ffmpeg.nodes.Node.src write-able (Whisper loader)
+# Patch 1: make ffmpeg.nodes.Node.src write-able (Whisper loader)
 # ---------------------------------------------------------------------------
 try:
     from ffmpeg.nodes import Node as FFNode  # type: ignore[attr-defined]
@@ -57,34 +63,47 @@ try:
             FFNode.src = property(_orig_get, _src_set)  # type: ignore[assignment]
             FFNode._nca_src_writeable = True  # type: ignore[attr-defined]
             logger.debug("Patched ffmpeg.Node.src mutator")
-except Exception as e:
-    logger.warning("ffmpeg.Node patch failed: %s", e)
+except Exception as exc:  # pragma: no cover
+    logger.debug("ffmpeg.Node patch skipped/failed: %s", exc)
 
 # ---------------------------------------------------------------------------
-# Robust patch 2: allow triton.runtime.jit.Kernel.src reassignment
+# Patch 2: allow Triton Kernel.src reassignment (covers old & new Triton)
 # ---------------------------------------------------------------------------
-try:
-    from triton.runtime.jit import Kernel as TritonKernel  # type: ignore
 
-    if not getattr(TritonKernel, "_nca_src_writeable", False):
-        _orig_kernel_setattr = TritonKernel.__setattr__
 
-        def _kernel_setattr(self, name, value):  # noqa: ANN001
-            if name == "src":
-                if hasattr(self, "_unsafe_update_src"):
-                    self._unsafe_update_src(value)  # type: ignore[attr-defined]
-                else:
-                    object.__setattr__(self, name, value)
-                if hasattr(self, "_hash"):
-                    object.__setattr__(self, "_hash", None)
-            else:
-                _orig_kernel_setattr(self, name, value)
+def _patch_triton_kernel() -> None:
+    """Make Triton Kernel.src mutable if Triton is present; stay silent otherwise."""
+    for mod_path in ("triton.runtime.jit", "triton.runtime"):
+        try:
+            mod = importlib.import_module(mod_path)
+            TritonKernel = getattr(mod, "Kernel", None)
+            if TritonKernel and not getattr(TritonKernel, "_nca_src_writeable", False):
+                _orig_setattr = TritonKernel.__setattr__
 
-        TritonKernel.__setattr__ = _kernel_setattr  # type: ignore[assignment]
-        TritonKernel._nca_src_writeable = True  # type: ignore[attr-defined]
-        logger.debug("Patched Triton Kernel.__setattr__ for 'src'")
-except Exception as e:
-    logger.warning("Triton Kernel patch failed: %s", e)
+                def _kernel_setattr(self, name, value):  # noqa: ANN001
+                    if name == "src":
+                        if hasattr(self, "_unsafe_update_src"):
+                            self._unsafe_update_src(value)  # type: ignore[attr-defined]
+                        else:
+                            object.__setattr__(self, name, value)
+                        if hasattr(self, "_hash"):
+                            object.__setattr__(self, "_hash", None)
+                    else:
+                        _orig_setattr(self, name, value)
+
+                TritonKernel.__setattr__ = _kernel_setattr  # type: ignore[assignment]
+                TritonKernel._nca_src_writeable = True  # type: ignore[attr-defined]
+                logger.debug("Patched Triton Kernel.__setattr__ for 'src' (%s)", mod_path)
+            return
+        except ModuleNotFoundError:
+            continue  # Triton not installed under this path — try next
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Triton Kernel patch attempt failed (%s): %s", mod_path, exc)
+            return
+    logger.debug("Triton not available — Kernel patch skipped")
+
+
+_patch_triton_kernel()
 
 # ---------------------------------------------------------------------------
 # CUDA / Whisper
@@ -102,7 +121,7 @@ WHISPER_MODEL = None  # lazy-loaded global
 
 
 def _get_video_resolution(path: str) -> Tuple[int, int]:
-    """Return (w, h) from ffprobe or default 1280×720."""
+    """Return (w, h) via ffprobe or default 1280×720 on failure."""
     try:
         probe = ffmpeg.probe(path)
         vs = next(s for s in probe["streams"] if s["codec_type"] == "video")
@@ -127,7 +146,7 @@ def _download_captions(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Whisper transcription (float32)
+# Whisper transcription helper
 # ---------------------------------------------------------------------------
 
 
@@ -146,11 +165,11 @@ def _generate_transcription(video_path: str, language: str = "auto") -> Dict:
 
     try:
         return WHISPER_MODEL.transcribe(video_path, **opts)
-    except AttributeError as e:  # Triton mutation bug fallback
-        if "Cannot set attribute 'src'" in str(e):
+    except AttributeError as err:
+        if "Cannot set attribute 'src'" in str(err):
             logger.warning(
-                "Triton kernel mutation bug hit while generating word timestamps. "
-                "Falling back to segment-level transcription."
+                "Triton mutation bug encountered. "
+                "Retrying transcription without word-level timing."
             )
             opts["word_timestamps"] = False
             return WHISPER_MODEL.transcribe(video_path, **opts)
@@ -171,27 +190,31 @@ def process_captioning_v1(
     language: str = "auto",
 ):
     """
-    End-to-end captioning:
-
     1. Download video
-    2. Transcribe (or fetch SRT/ASS)
-    3. Build ASS via caption_helpers
-    4. Burn-in subtitles with NVENC
+    2. Transcribe (or load SRT/ASS)
+    3. Build ASS with caption_helpers
+    4. Burn subtitles using NVENC
     """
     try:
-        # 1. Download video ------------------------------------------------
+        # -----------------------------------------------------------------
+        # 1. Download source video
+        # -----------------------------------------------------------------
         try:
             video_path = download_file(video_url, LOCAL_STORAGE_PATH)
             logger.info("[%s] Video downloaded → %s", job_id, video_path)
-        except Exception as e:
-            return {"error": f"Download failed: {e}"}
+        except Exception as exc:
+            return {"error": f"Download failed: {exc}"}
 
-        # 2. Prep ---------------------------------------------------------
+        # -----------------------------------------------------------------
+        # 2. Prepare vars
+        # -----------------------------------------------------------------
         width, height = _get_video_resolution(video_path)
         style = settings.get("style", "classic").lower()
         replace_dict = {item["find"]: item["replace"] for item in replace}
 
-        # 3. Captions / transcription ------------------------------------
+        # -----------------------------------------------------------------
+        # 3. Get captions / transcription
+        # -----------------------------------------------------------------
         if captions:
             cap_content = _download_captions(captions) if _is_url(captions) else captions
             if "[Script Info]" in cap_content:  # already ASS
@@ -211,44 +234,61 @@ def process_captioning_v1(
                 ass_text = process_subtitle_events(
                     transcription_like, style, settings, replace_dict, (width, height)
                 )
-        else:  # Whisper it
+        else:
             transcription = _generate_transcription(video_path, language)
             ass_text = process_subtitle_events(
                 transcription, style, settings, replace_dict, (width, height)
             )
 
-        # 4. Save ASS ------------------------------------------------------
+        # -----------------------------------------------------------------
+        # 4. Save ASS file
+        # -----------------------------------------------------------------
         ass_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.ass")
-        with open(ass_path, "w", encoding="utf-8") as f:
-            f.write(ass_text)
+        with open(ass_path, "w", encoding="utf-8") as fp:
+            fp.write(ass_text)
         logger.info("[%s] Subtitles saved → %s", job_id, ass_path)
 
-        # 5. Burn-in with raw FFmpeg (NVENC) ------------------------------
+        # -----------------------------------------------------------------
+        # 5. Burn-in subtitles with FFmpeg
+        # -----------------------------------------------------------------
         output_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_captioned.mp4")
-        # ---- inside process_captioning_v1() (build command section) ----
-        vf_parts: List[str] = []
 
-        # ensure even dimensions for 2-mod-h264
+        vf_parts: List[str] = []
+        # Ensure even dimensions for h264
         if width % 2 or height % 2:
-            # use CPU scale, not scale_npp
-            vf_parts.append(f"scale=w={width//2*2}:h={height//2*2}")
+            vf_parts.append(f"scale=w={width//2*2}:h={height//2*2}")  # CPU scale
 
         vf_parts.append(f"subtitles={shlex.quote(ass_path)}")
         vf_arg = ",".join(vf_parts)
 
         cmd = [
             "ffmpeg",
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-hwaccel", "cuda",               # keep NVDEC
-            # -hwaccel_output_format cuda,    # <<< REMOVE THIS LINE
-            "-i", video_path,
-            "-vf", vf_arg,
-            "-c:v", "h264_nvenc",             # still NVENC on the way out
-            "-preset", "p4", "-rc", "vbr", "-qmin", "19", "-qmax", "23",
-            "-c:a", "copy",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-hwaccel",
+            "cuda",       # NVDEC decode (frames land in CPU memory)
+            "-i",
+            video_path,
+            "-vf",
+            vf_arg,
+            "-c:v",
+            "h264_nvenc",  # NVENC encode
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-qmin",
+            "19",
+            "-qmax",
+            "23",
+            "-c:a",
+            "copy",
             output_path,
         ]
         logger.info("[%s] FFmpeg cmd: %s", job_id, " ".join(cmd))
+
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             logger.error("[%s] FFmpeg stderr:\n%s", job_id, res.stderr)
