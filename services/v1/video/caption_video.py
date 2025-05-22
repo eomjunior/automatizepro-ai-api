@@ -44,129 +44,60 @@ if not logger.hasHandlers():
 # ---------------------------------------------------------------------------
 # Robust patch 1: Make ffmpeg.nodes.Node.src write‑able (Whisper audio loader)
 # ---------------------------------------------------------------------------
-try:
-    from ffmpeg.nodes import Node as FFNode  # type: ignore
-    if not getattr(FFNode, "_nca_src_writeable", False):
-        if hasattr(FFNode, "src") and isinstance(FFNode.src, property):
-            _orig_get = FFNode.src.fget  # type: ignore[attr-defined]
-            def _src_set(self, value):  # noqa: ANN001
-                object.__setattr__(self, "_Node__src", value)
-                object.__setattr__(self, "_hash", None)
-            FFNode.src = property(_orig_get, _src_set)  # type: ignore[assignment]
-            FFNode._nca_src_writeable = True  # type: ignore[attr-defined]
-            logger.debug("Patched ffmpeg.Node.src mutator")
-except Exception as patch_err:
-    logger.warning("ffmpeg.Node patch failed (may be unnecessary): %s", patch_err)
-
 # ---------------------------------------------------------------------------
-# Robust patch 2: Allow triton.runtime.jit.Kernel.src reassignment (Whisper median_filter)
-# ---------------------------------------------------------------------------
-try:
-    from triton.runtime.jit import Kernel as TritonKernel  # type: ignore
-    if not getattr(TritonKernel, "_nca_src_writeable", False):
-        _orig_kernel_setattr = TritonKernel.__setattr__
-        def _kernel_setattr(self, name, value):  # noqa: ANN001
-            if name == "src":
-                # Use official helper if available
-                if hasattr(self, "_unsafe_update_src"):
-                    self._unsafe_update_src(value)  # type: ignore[attr-defined]
-                else:
-                    object.__setattr__(self, name, value)
-                # Clear cached hash if it exists
-                if hasattr(self, "_hash"):
-                    object.__setattr__(self, "_hash", None)
-            else:
-                _orig_kernel_setattr(self, name, value)
-        TritonKernel.__setattr__ = _kernel_setattr  # type: ignore[assignment]
-        TritonKernel._nca_src_writeable = True  # type: ignore[attr-defined]
-        logger.debug("Patched triton.runtime.jit.Kernel.__setattr__ for 'src'")
-except Exception as patch_err:
-    logger.warning("Triton Kernel patch failed (may not be needed): %s", patch_err)
-# ---------------------------------------------------------------------------
-try:
-    from ffmpeg.nodes import Node as FFNode  # type: ignore
-
-    # Skip if we already swapped the property
-    if not getattr(FFNode, "_nca_src_writeable", False):
-        if hasattr(FFNode, "src") and isinstance(FFNode.src, property):
-            _orig_get = FFNode.src.fget  # type: ignore[attr-defined]
-
-            def _new_set(self, value):  # noqa: ANN001
-                # Directly assign to hidden attribute and drop cached hash
-                object.__setattr__(self, "_Node__src", value)
-                object.__setattr__(self, "_hash", None)
-
-            FFNode.src = property(_orig_get, _new_set, _orig_get.__delete__ if _orig_get else None)  # type: ignore[assignment]
-            FFNode._nca_src_writeable = True  # type: ignore[attr-defined]
-            logger.debug("Patched ffmpeg.Node.src property mutator (new setter)")
-        else:
-            logger.debug("ffmpeg.Node has no property 'src' – mutation patch not required")
-except Exception as patch_err:  # pragma: no cover
-    logger.warning("Failed to patch ffmpeg.Node.src setter: %s", patch_err)
-# ---------------------------------------------------------------------------
-try:
-    from ffmpeg.nodes import Node as FFNode  # type: ignore
-
-    if not getattr(FFNode, "_nca_mutable_src", False):
-        _orig_setattr = FFNode.__setattr__
-
-        def _nca_setattr(self, name, value):  # noqa: ANN001
-            if name == "src":
-                # Directly update the hidden attr, then clear cached hash
-                object.__setattr__(self, "_Node__src", value)
-                object.__setattr__(self, "_hash", None)
-            else:
-                _orig_setattr(self, name, value)
-
-        FFNode.__setattr__ = _nca_setattr  # type: ignore[assignment]
-        FFNode._nca_mutable_src = True  # type: ignore[attr-defined]
-        logger.debug("ffmpeg.Node.__setattr__ patched for mutable 'src'.")
-except Exception as patch_err:  # pragma: no cover
-    logger.warning("ffmpeg.Node patch failed (may not be needed): %s", patch_err)
-
-# ---------------------------------------------------------------------------
-# CUDA / Whisper
-# ---------------------------------------------------------------------------
-USE_CUDA = torch.cuda.is_available()
-CUDA_DEVICE = os.getenv("CUDA_VISIBLE_DEVICES", "0")
-logger.info("CUDA %s", f"enabled (GPU {CUDA_DEVICE})" if USE_CUDA else "not available; using CPU")
-
-WHISPER_DEVICE = "cuda" if USE_CUDA else "cpu"
-WHISPER_MODEL = None  # lazy-load global
-
-# ---------------------------------------------------------------------------
-# Helper utilities
+# Minimal internal subtitle renderer (classic center‑aligned)
 # ---------------------------------------------------------------------------
 
-def get_video_resolution(path: str) -> tuple[int, int]:
-    try:
-        probe = ffmpeg.probe(path)
-        vs = next(s for s in probe["streams"] if s["codec_type"] == "video")
-        return int(vs["width"]), int(vs["height"])
-    except Exception as exc:
-        logger.warning("ffprobe failed (%s); defaulting 1280×720", exc)
-        return 1280, 720
+def _format_ass_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    return f"{h}:{m:02}:{s:02}.{cs:02}"
 
 
-def is_url(text: str) -> bool:
-    try:
-        return urlparse(text).scheme in {"http", "https"}
-    except Exception:
-        return False
+def _ass_header(width: int, height: int, font_size: int = 48) -> str:
+    return (
+        "[Script Info]
+"
+        "ScriptType: v4.00+
+"
+        f"PlayResX: {width}
+"
+        f"PlayResY: {height}
+
+"
+        "[V4+ Styles]
+"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+"
+        f"Style: Default,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,20,20,20,0
+
+"
+        "[Events]
+"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"
+    )
 
 
-def download_captions(url: str) -> str:
-    logger.info("Downloading captions → %s", url)
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.text
-
-# Placeholder for style‑handling helpers
-try:
-    from caption_helpers import process_subtitle_events  # external module
-except ImportError:
-    def process_subtitle_events(*args, **kwargs):  # type: ignore
-        raise NotImplementedError("process_subtitle_events() missing; import it from caption_helpers.")
+def process_subtitle_events(transcription_result: Dict, style: str, settings: Dict, repl: Dict, res: tuple[int, int]):
+    """Fallback ASS generator: no styling beyond centered safe classic."""
+    width, height = res
+    header = _ass_header(width, height, int(height * 0.05))
+    events = []
+    for seg in transcription_result["segments"]:
+        text = seg.get("text", "").strip().replace("
+", " ")
+        for old, new in repl.items():
+            text = text.replace(old, new)
+        start = _format_ass_time(seg["start"])
+        end = _format_ass_time(seg["end"])
+        events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+    return header + "
+".join(events) + "
+"
+# --------------------------------------------------------------------------- missing; import it from caption_helpers.")
 
 # ---------------------------------------------------------------------------
 # Whisper transcription (float32)
