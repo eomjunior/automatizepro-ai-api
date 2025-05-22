@@ -173,16 +173,31 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def generate_transcription(video_path: str, language: str = "auto") -> Dict:
+    """Run Whisper transcription. If Triton 'src' mutation bug occurs, retry with
+    word-level timing disabled (segment-level only)."""
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
-        logger.info("Loading Whisper‑base")
+        logger.info("Loading Whisper-base model → %s", WHISPER_DEVICE)
         WHISPER_MODEL = whisper.load_model("base", device=WHISPER_DEVICE)
+
     opts = {
         "word_timestamps": True,
         "language": None if language == "auto" else language,
         "verbose": False,
     }
-    return WHISPER_MODEL.transcribe(video_path, **opts)
+
+    try:
+        return WHISPER_MODEL.transcribe(video_path, **opts)
+    except AttributeError as e:
+        # Triton kernel 'src' immutability bug encountered
+        if "Cannot set attribute 'src'" in str(e):
+            logger.warning(
+                "Triton kernel mutation bug hit while generating word timestamps. "
+                "Falling back to segment‑level transcription without word timing."
+            )
+            opts["word_timestamps"] = False
+            return WHISPER_MODEL.transcribe(video_path, **opts)
+        raise
 
 # ---------------------------------------------------------------------------
 # Main pipeline
