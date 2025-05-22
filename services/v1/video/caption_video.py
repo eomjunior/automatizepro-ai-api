@@ -42,7 +42,46 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 # ---------------------------------------------------------------------------
-# Robust patch: make ffmpeg.nodes.Node.src writeable
+# Robust patch 1: Make ffmpeg.nodes.Node.src write‑able (Whisper audio loader)
+# ---------------------------------------------------------------------------
+try:
+    from ffmpeg.nodes import Node as FFNode  # type: ignore
+    if not getattr(FFNode, "_nca_src_writeable", False):
+        if hasattr(FFNode, "src") and isinstance(FFNode.src, property):
+            _orig_get = FFNode.src.fget  # type: ignore[attr-defined]
+            def _src_set(self, value):  # noqa: ANN001
+                object.__setattr__(self, "_Node__src", value)
+                object.__setattr__(self, "_hash", None)
+            FFNode.src = property(_orig_get, _src_set)  # type: ignore[assignment]
+            FFNode._nca_src_writeable = True  # type: ignore[attr-defined]
+            logger.debug("Patched ffmpeg.Node.src mutator")
+except Exception as patch_err:
+    logger.warning("ffmpeg.Node patch failed (may be unnecessary): %s", patch_err)
+
+# ---------------------------------------------------------------------------
+# Robust patch 2: Allow triton.runtime.jit.Kernel.src reassignment (Whisper median_filter)
+# ---------------------------------------------------------------------------
+try:
+    from triton.runtime.jit import Kernel as TritonKernel  # type: ignore
+    if not getattr(TritonKernel, "_nca_src_writeable", False):
+        _orig_kernel_setattr = TritonKernel.__setattr__
+        def _kernel_setattr(self, name, value):  # noqa: ANN001
+            if name == "src":
+                # Use official helper if available
+                if hasattr(self, "_unsafe_update_src"):
+                    self._unsafe_update_src(value)  # type: ignore[attr-defined]
+                else:
+                    object.__setattr__(self, name, value)
+                # Clear cached hash if it exists
+                if hasattr(self, "_hash"):
+                    object.__setattr__(self, "_hash", None)
+            else:
+                _orig_kernel_setattr(self, name, value)
+        TritonKernel.__setattr__ = _kernel_setattr  # type: ignore[assignment]
+        TritonKernel._nca_src_writeable = True  # type: ignore[attr-defined]
+        logger.debug("Patched triton.runtime.jit.Kernel.__setattr__ for 'src'")
+except Exception as patch_err:
+    logger.warning("Triton Kernel patch failed (may not be needed): %s", patch_err)
 # ---------------------------------------------------------------------------
 try:
     from ffmpeg.nodes import Node as FFNode  # type: ignore
