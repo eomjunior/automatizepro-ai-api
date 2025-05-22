@@ -8,6 +8,7 @@ from services.file_management import download_file
 from config import LOCAL_STORAGE_PATH
 
 
+<<<<<<< HEAD
 def process_video_concatenate(
     media_urls,
     job_id,
@@ -19,6 +20,14 @@ def process_video_concatenate(
     preset: str = "p5", # NVENC presets p1-p7 (p1 fastest, p7 best quality)
     cq: int = 19        # constant-quality target (lower = better quality)
 ):
+=======
+def process_video_concatenate(media_urls, job_id, webhook_url=None, *,
+                                  gpu_index: int = 0,
+                                  vb='10M',       # target video bitrate
+                                  ab='192k',      # target audio bitrate
+                                  preset='p5',    # p1-p7 (p1 fastest, p7 best quality)
+                                  cq=19):         # constant-quality target (lower = better)
+>>>>>>> 080c8f1a8b041c622e61bc83f07721f1e5b8c8aa
     """
     Concatenate multiple videos using NVIDIA NVDEC/NVENC.
 
