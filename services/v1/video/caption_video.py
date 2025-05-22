@@ -47,6 +47,27 @@ if not logger.hasHandlers():
 try:
     from ffmpeg.nodes import Node as FFNode  # type: ignore
 
+    # Skip if we already swapped the property
+    if not getattr(FFNode, "_nca_src_writeable", False):
+        if hasattr(FFNode, "src") and isinstance(FFNode.src, property):
+            _orig_get = FFNode.src.fget  # type: ignore[attr-defined]
+
+            def _new_set(self, value):  # noqa: ANN001
+                # Directly assign to hidden attribute and drop cached hash
+                object.__setattr__(self, "_Node__src", value)
+                object.__setattr__(self, "_hash", None)
+
+            FFNode.src = property(_orig_get, _new_set, _orig_get.__delete__ if _orig_get else None)  # type: ignore[assignment]
+            FFNode._nca_src_writeable = True  # type: ignore[attr-defined]
+            logger.debug("Patched ffmpeg.Node.src property mutator (new setter)")
+        else:
+            logger.debug("ffmpeg.Node has no property 'src' – mutation patch not required")
+except Exception as patch_err:  # pragma: no cover
+    logger.warning("Failed to patch ffmpeg.Node.src setter: %s", patch_err)
+# ---------------------------------------------------------------------------
+try:
+    from ffmpeg.nodes import Node as FFNode  # type: ignore
+
     if not getattr(FFNode, "_nca_mutable_src", False):
         _orig_setattr = FFNode.__setattr__
 
