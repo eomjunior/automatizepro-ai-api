@@ -111,7 +111,7 @@ def process_image_to_video(
             "-framerate", str(frame_rate),
             "-i", image_path,
             "-t", str(length),
-            '-vf', f"scale={scale_dims},zoompan=z='min(1+({zoom_speed}*{length})*on/{total_frames}, {zoom_factor})':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={output_dims},fps={frame_rate},format=nv12",
+            '-vf', f"scale={scale_dims},zoompan=z='min(1+({zoom_speed}*{length})*on/{total_frames}, {zoom_factor})':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={output_dims},fps={frame_rate},format=nv12,hwupload",
             "-c:v", encoder,
             *gpu_opt,
             "-preset", preset,
