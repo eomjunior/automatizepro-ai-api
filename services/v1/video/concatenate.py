@@ -7,7 +7,7 @@ from services.file_management import download_file
 from config import LOCAL_STORAGE_PATH
 
 
-def process_video_concatenate_gpu(media_urls, job_id, webhook_url=None, *,
+def process_video_concatenate(media_urls, job_id, webhook_url=None, *,
                                   gpu_index: int = 0,
                                   vb='10M',       # target video bitrate
                                   ab='192k',      # target audio bitrate

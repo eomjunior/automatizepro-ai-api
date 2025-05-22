@@ -91,4 +91,24 @@ def process_ffmpeg_compose(data: dict, job_id: str,
 
         out_name = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_output_{idx}.{ext}")
         output_files.append(out_name)
-        cmd.appe
+        cmd.append(out_name)
+
+    # ── 5. Run FFmpeg ────────────────────────────────────────────
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg failed ({e.returncode}):\n{e.stderr}") from e
+
+    # ── 6. Cleanup inputs ────────────────────────────────────────
+    for inp in data["inputs"]:
+        try:
+            os.remove(inp["_local_path"])
+        except FileNotFoundError:
+            pass
+
+    # ── 7. Optional metadata ────────────────────────────────────
+    if data.get("metadata"):
+        for f in output_files:
+            outputs_meta.append(get_metadata(f, data["metadata"]))
+
+    return output_files, outputs_meta
