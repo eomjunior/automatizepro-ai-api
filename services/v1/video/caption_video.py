@@ -25,7 +25,7 @@ import srt
 import torch
 import whisper  # type: ignore
 
-from caption_helpers import process_subtitle_events  # <-- NEW import
+from .caption_helpers import process_subtitle_events  # <-- NEW import
 from config import LOCAL_STORAGE_PATH
 from services.cloud_storage import upload_file  # noqa: F401
 from services.file_management import download_file
