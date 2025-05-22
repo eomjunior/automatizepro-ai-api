@@ -1,9 +1,11 @@
 """
-Optimized GPU-accelerated captioning pipeline (safe precision)
-============================================================
-• CUDA acceleration for Whisper + FFmpeg.
-• Whisper remains in *float32* to avoid dtype mismatch errors.
-• NVDEC → GPU filters → NVENC for subtitle burn‑in.
+Optimized GPU-accelerated captioning pipeline (stable)
+====================================================
+Changes in this revision
+-----------------------
+1. **Avoids ffmpeg‑python Node mutation error** by calling FFmpeg via `subprocess.run()` instead of chaining streams.
+2. Keeps Whisper on float32 to prevent dtype mismatches.
+3. Maintains CUDA NVDEC → GPU filters → NVENC path.
 
 Copyright (c) 2025 Stephen G. Pope
 GPL-2.0-or-later
@@ -11,10 +13,12 @@ GPL-2.0-or-later
 
 import os
 import logging
+import shlex
+import subprocess
 from urllib.parse import urlparse
 from typing import Dict, List, Union
 
-import ffmpeg
+import ffmpeg  # still used only for `probe`
 import requests
 import srt
 import torch
@@ -24,15 +28,12 @@ from services.file_management import download_file
 from services.cloud_storage import upload_file  # noqa: F401 (integration hook)
 from config import LOCAL_STORAGE_PATH
 
-# ----------------------------------------------------------------------------
-# Logging setup
-# ----------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.hasHandlers():
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
-    logger.addHandler(_handler)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
+    logger.addHandler(_h)
 
 # ----------------------------------------------------------------------------
 # CUDA helpers
@@ -43,30 +44,22 @@ CUDA_DEVICE = os.getenv("CUDA_VISIBLE_DEVICES", "0")
 if USE_CUDA:
     logger.info(f"CUDA available — using GPU {CUDA_DEVICE}")
 else:
-    logger.warning("CUDA not available, falling back to CPU (slower)")
+    logger.warning("CUDA not available, falling back to CPU")
 
 WHISPER_DEVICE = "cuda" if USE_CUDA else "cpu"
-WHISPER_MODEL = None  # lazy‑load global
+WHISPER_MODEL = None  # lazy load
 
 # ----------------------------------------------------------------------------
-# Utility helpers
+# Utilities
 # ----------------------------------------------------------------------------
-
-def rgb_to_ass_color(rgb: str) -> str:
-    rgb = rgb.lstrip("#")
-    if len(rgb) != 6:
-        return "&H00FFFFFF"
-    r, g, b = (int(rgb[i : i + 2], 16) for i in (0, 2, 4))
-    return f"&H00{b:02X}{g:02X}{r:02X}"
-
 
 def get_video_resolution(path: str) -> tuple[int, int]:
     try:
         probe = ffmpeg.probe(path)
-        vid_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
-        return int(vid_stream["width"]), int(vid_stream["height"])
+        vid = next(s for s in probe["streams"] if s["codec_type"] == "video")
+        return int(vid["width"]), int(vid["height"])
     except Exception as exc:
-        logger.warning(f"Resolution probe failed: {exc}. Falling back to 1280x720")
+        logger.warning(f"ffprobe failed: {exc}; defaulting to 1280x720")
         return 1280, 720
 
 
@@ -78,31 +71,29 @@ def is_url(text: str) -> bool:
 
 
 def download_captions(url: str) -> str:
-    logger.info(f"Fetching captions: {url}")
-    rsp = requests.get(url, timeout=30)
-    rsp.raise_for_status()
-    return rsp.text
+    logger.info(f"Downloading captions → {url}")
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-# ---------------------------------------------------------------------------
-# Placeholder import for complex style handlers
-# ---------------------------------------------------------------------------
+# Placeholder for style handling helpers
 try:
     from caption_helpers import process_subtitle_events  # external module
 except ImportError:
     def process_subtitle_events(*args, **kwargs):  # type: ignore
         raise NotImplementedError(
-            "process_subtitle_events() helper not found. Import from the original "
-            "code or merge the style‑handler section into this file."
+            "process_subtitle_events() is missing. Import it from the original "
+            "captioning code or integrate the style-handler section here."
         )
 
 # ----------------------------------------------------------------------------
-# Whisper transcription (kept in float32 to avoid dtype mismatch with kernels)
+# Whisper transcription (float32)
 # ----------------------------------------------------------------------------
 
 def generate_transcription(video_path: str, language: str = "auto") -> Dict:
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
-        logger.info("Loading Whisper‑base model (float32)")
+        logger.info("Loading Whisper‑base (float32)")
         WHISPER_MODEL = whisper.load_model("base", device=WHISPER_DEVICE)
     opts = {
         "word_timestamps": True,
@@ -112,7 +103,7 @@ def generate_transcription(video_path: str, language: str = "auto") -> Dict:
     return WHISPER_MODEL.transcribe(video_path, **opts)
 
 # ----------------------------------------------------------------------------
-# Main GPU pipeline
+# Main pipeline
 # ----------------------------------------------------------------------------
 
 def process_captioning_v1(
@@ -124,26 +115,31 @@ def process_captioning_v1(
     language: str = "auto",
 ):
     try:
-        # Download video ----------------------------------------------------
+        # ---------------------------------------------------------------
+        # Download video
+        # ---------------------------------------------------------------
         try:
             video_path = download_file(video_url, LOCAL_STORAGE_PATH)
             logger.info(f"[{job_id}] Video downloaded → {video_path}")
         except Exception as e:
-            return {"error": f"Video download failed: {e}"}
+            return {"error": f"Download failed: {e}"}
 
-        # Setup -------------------------------------------------------------
-        resolution = get_video_resolution(video_path)
+        # ---------------------------------------------------------------
+        # Prepare params
+        # ---------------------------------------------------------------
+        width, height = get_video_resolution(video_path)
         style_type = settings.get("style", "classic").lower()
         replace_dict = {item["find"]: item["replace"] for item in replace}
 
-        # Captions / transcription -----------------------------------------
+        # ---------------------------------------------------------------
+        # Captions handling / transcription
+        # ---------------------------------------------------------------
         if captions:
             cap_content = download_captions(captions) if is_url(captions) else captions
             if "[Script Info]" in cap_content:
-                subtitle_content = cap_content  # already ASS
+                subtitle_text = cap_content  # already ASS
             else:
-                # quick SRT -> transcription result
-                transcription_result = {
+                transcription_like = {
                     "segments": [
                         {
                             "start": sub.start.total_seconds(),
@@ -154,51 +150,59 @@ def process_captioning_v1(
                         for sub in srt.parse(cap_content)
                     ]
                 }
-                subtitle_content = process_subtitle_events(
-                    transcription_result, style_type, settings, replace_dict, resolution
+                subtitle_text = process_subtitle_events(
+                    transcription_like, style_type, settings, replace_dict, (width, height)
                 )
         else:
             transcription = generate_transcription(video_path, language)
-            subtitle_content = process_subtitle_events(
-                transcription, style_type, settings, replace_dict, resolution
+            subtitle_text = process_subtitle_events(
+                transcription, style_type, settings, replace_dict, (width, height)
             )
 
-        # Write subtitles ---------------------------------------------------
+        # ---------------------------------------------------------------
+        # Write ASS file
+        # ---------------------------------------------------------------
         subtitle_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.ass")
         with open(subtitle_path, "w", encoding="utf-8") as fh:
-            fh.write(subtitle_content)
+            fh.write(subtitle_text)
         logger.info(f"[{job_id}] Subtitles saved → {subtitle_path}")
 
-        # Burn in with FFmpeg + NVENC --------------------------------------
+        # ---------------------------------------------------------------
+        # Burn in subtitles via raw FFmpeg command
+        # ---------------------------------------------------------------
         output_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_captioned.mp4")
-        vf_chain = [f"subtitles={subtitle_path}"]
-        if resolution[0] % 2 or resolution[1] % 2:
-            vf_chain.insert(0, f"scale_npp=w={resolution[0]//2*2}:h={resolution[1]//2*2}")
-        vf_param = ",".join(vf_chain)
 
-        try:
-            (
-                ffmpeg
-                .input(video_path, hwaccel="cuda", hwaccel_output_format="cuda")
-                .output(
-                    output_path,
-                    vf=vf_param,
-                    vcodec="h264_nvenc",
-                    acodec="copy",
-                    preset="p4",
-                    rc="vbr",
-                    qmin=19,
-                    qmax=23,
-                )
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            )
-            logger.info(f"[{job_id}] FFmpeg completed → {output_path}")
-            return output_path
-        except ffmpeg.Error as err:
-            stderr = err.stderr.decode() if err.stderr else "(no stderr)"
-            logger.error(f"[{job_id}] FFmpeg error:\n{stderr}")
-            return {"error": f"FFmpeg error: {stderr}"}
+        vf_filters = []
+        # ensure even dimensions for NVENC
+        if width % 2 or height % 2:
+            vf_filters.append(f"scale_npp=w={width//2*2}:h={height//2*2}")
+        vf_filters.append(f"subtitles={shlex.quote(subtitle_path)}")
+        vf_param = ",".join(vf_filters)
+
+        cmd = [
+            "ffmpeg", "-y",  # overwrite
+            "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-i", video_path,
+            "-vf", vf_param,
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",
+            "-rc", "vbr",
+            "-qmin", "19",
+            "-qmax", "23",
+            "-c:a", "copy",
+            output_path,
+        ]
+
+        logger.info(f"[{job_id}] Running FFmpeg: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"[{job_id}] FFmpeg stderr:\n{result.stderr}")
+            return {"error": f"FFmpeg failed: {result.stderr.strip()}"}
+
+        logger.info(f"[{job_id}] Captioned video written → {output_path}")
+        return output_path
 
     except Exception as exc:
         logger.exception(f"[{job_id}] Unhandled exception: {exc}")
