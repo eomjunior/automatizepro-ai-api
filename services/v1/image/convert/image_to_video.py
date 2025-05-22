@@ -67,6 +67,7 @@ def process_image_to_video(
     output_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.mp4")
     scale_dims  = "7680:4320" if landscape else "4320:7680"
     output_dims = "1920x1080" if landscape else "1080x1920"
+    output_dims_colon = output_dims.replace("x", ":")   # ← add or keep this line
     total_frames = int(length * frame_rate)
     zoom_factor  = 1 + zoom_speed * length            # final zoom at last frame
 
@@ -74,6 +75,12 @@ def process_image_to_video(
                 frame_rate, length)
     logger.info("Scale   : %s → %s", scale_dims, output_dims)
     logger.info("Zoom    : speed %.4f, final ×%.3f", zoom_speed, zoom_factor)
+
+
+    encoder = "h264_nvenc"
+    preset = "p4"
+    hwaccel = ["-hwaccel", "cuda", "-hwaccel_device", str(0)]
+    gpu_opt = ["-gpu", str(0)]   # harmless on new FFmpeg
 
     # ----------------------------------------------------------------------
     # GPU workflow:
@@ -83,35 +90,36 @@ def process_image_to_video(
     #   4. Encode NVENC               -> h264_nvenc
     # ----------------------------------------------------------------------
     vf = (
-        f"scale={scale_dims},"                                      # ❶ base up-scale
-        f"zoompan="
-        f"z='min(1+({zoom_speed}*{length})*on/{total_frames},"
-        f"{zoom_factor})':"
-        f"d={total_frames}:"
-        f"x='iw/2-(iw/zoom/2)':"
-        f"y='ih/2-(ih/zoom/2)':"
-        f"s={output_dims},"                                         # ❷ zoomed canvas
-        "fps=fps=" + str(frame_rate) + ","                          # ❸ frame pacing
-        "format=yuv420p,"                                           # ❹ colourspace for hwupload
-        "hwupload_cuda,"                                            # ❺ CPU→GPU
-        f"scale_cuda={output_dims}"                                 # ❻ final touch-up (GPU)
+    	    f"scale={scale_dims},"
+            f"zoompan="
+            f"z='min(1+({zoom_speed}*{length})*on/{total_frames},{zoom_factor})':"
+            f"d={total_frames}:"
+            f"x='iw/2-(iw/zoom/2)':"
+            f"y='ih/2-(ih/zoom/2)':"
+            f"s={output_dims},"
+            f"fps={frame_rate},"
+            # Hand off to GPU
+            f"format=nv12,hwupload_cuda,"
+            # Correct CUDA resizer syntax (WIDTH:HEIGHT)
+            f"scale_cuda={output_dims_colon}:interp_algo=lanczos"
     )
-
     cmd = [
-        "ffmpeg",
-        "-hide_banner", "-loglevel", "error",
-        "-loop", "1",
-        "-framerate", str(frame_rate),
-        "-i", image_path,
-        "-t", str(length),
-        "-filter:v", vf,
-        "-c:v", "h264_nvenc",
-        "-gpu", str(gpu_device),            # ★ new – target GPU
-        "-preset", "p4",                    # ★ new – NVENC speed/quality
-        "-b:v", bitrate,                    # ★ new – CBR / VBR target
-        "-pix_fmt", "yuv420p",
-        "-y",                               # ★ new – overwrite output
-        output_path,
+    	    "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            *hwaccel,
+            "-loop", "1",
+            "-framerate", str(frame_rate),
+            "-i", image_path,
+            "-t", str(length),
+            '-vf', f"scale={scale_dims},zoompan=z='min(1+({zoom_speed}*{length})*on/{total_frames}, {zoom_factor})':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={output_dims},fps={frame_rate},format=nv12",
+            "-c:v", encoder,
+            *gpu_opt,
+            "-preset", preset,
+            "-b:v", "10M",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-y",
+            output_path
     ]
 
     logger.info("FFmpeg (GPU) : %s", " ".join(cmd))
