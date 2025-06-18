@@ -67,7 +67,7 @@ def process_image_to_video(
             "-loop", "1", "-framerate", str(frame_rate),
             "-i", image_path,
             "-t", str(length),
-            "-vf", vf,
+            "--filter_complex ", vf,
         ]
 
         if use_gpu:
@@ -75,6 +75,8 @@ def process_image_to_video(
                 "-c:v", "h264_nvenc",
                 "-gpu", str(gpu_id),
                 "-preset", "p4",
+                "-rc","constqp",
+                "-qp", "20",
                 "-b:v", "10M",
             ]
         else:  # pure CPU fall-back
